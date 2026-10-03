@@ -107,13 +107,17 @@ records may contain private command arguments and output; never commit them.
 npm test
 ```
 
-Tests run real detached commands to check survival after dispatch exits, exit
-codes, spawn errors, cancellation of descendants, timeouts, private records, and
-bounded logs. Mock host tests cover idle waiting, at-most-once attempts,
-acknowledgement loss, transport framing, and App Server request shape. They do not
-prove compatibility with every Codex release. Desktop preflight and a completion
-waiting for the current chat to become idle were also exercised during development.
-An idle-chat continuation is verified separately from a host accepting a request.
+All 16 tests passed locally and in GitHub Actions on macOS and Ubuntu. Tests run
+real detached commands to check survival after dispatch exits, exit codes, spawn
+errors, cancellation of descendants, timeouts, private records, and bounded logs.
+Mock host tests cover idle waiting, at-most-once attempts, acknowledgement loss,
+transport framing, retained Desktop connections, and App Server request shape.
+
+A live smoke test on macOS with Codex Desktop's 0.159.2 runtime confirmed command
+completion, waiting while the original chat was active, an accepted completion
+message after it became idle, and an actual agent continuation in that same chat.
+This does not prove compatibility with every Codex release. App Server mode has
+mock protocol coverage; it has not been verified against a live App Server here.
 
 ## License
 
