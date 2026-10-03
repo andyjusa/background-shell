@@ -1,12 +1,32 @@
 ---
 name: background-shell
-description: Run authorized long-running shell commands in the background, inspect or cancel owned jobs, and wake the originating Codex chat once on completion when the user requests notification or automatic continuation. Use for tests, builds, and finite computations; not for interactive PTYs, arbitrary filesystem watching, or scheduled recurring work.
+description: Run authorized finite shell jobs that can progress without further input in the background, inspect or cancel owned jobs, and wake the originating Codex chat once on completion under a user request or standing user authorization. Use for tests, builds, and computations; not for interactive PTYs or scheduled recurring work.
 ---
 
 # Background Shell
 
 Run a finite command under a detached supervisor. Waiting uses no model inference.
 The command and completion wakeup are separate operations: report both statuses.
+
+## Decide what to detach
+
+Detach work that can proceed without another decision. For exploratory scans or
+debugging, examine a small sample or an existing partial result first, then detach
+the independent part. Duration alone is not a reason to suspend the whole task.
+Continue useful independent work and report available partial findings.
+
+For commands that may block on I/O, network access, or an unbounded traversal,
+choose a reasonable `--timeout-ms` before dispatch. Where needed, implement
+per-item timeouts or a progress watchdog in the actual command/wrapper. Choose
+limits appropriate to that job; don't apply a short scan limit to a long training
+run. Keep readable progress counters, current stage, and partial results outside
+a long-held transaction so a status check can use them.
+
+This helper has no built-in no-progress detector. Completion wakes the chat only
+after the command exits; a hung command can remain `running` indefinitely without
+a runtime limit. A watchdog must actually exist to detect stalls while the chat
+is idle. Log silence or low CPU alone does not establish a stall: use expected
+stage timings and task-specific progress signals.
 
 ## Dispatch
 
@@ -19,9 +39,10 @@ the app enforces its own local peer authorization. Never disable that authorizat
   dispatch --wake --notify desktop --cwd /absolute/project -- npm test
 ```
 
-`--wake` requires a user request to notify or continue this chat when the job ends.
-Background execution alone does not authorize a follow-up message. Without that
-authorization, omit `--wake`; notification defaults to `none`.
+`--wake` requires authorization to notify or continue this chat when the job ends.
+A standing user instruction to automatically background jobs and wake their
+originating chat supplies that authorization; do not ask again for each job.
+Without such authorization, omit `--wake`; notification defaults to `none`.
 Use the current `CODEX_THREAD_ID` (or `CODEX_SESSION_ID`) automatically. Supply a
 different `--thread-id` only when the user explicitly authorizes that destination.
 Do not specify model, thinking effort, approval policy, or sandbox overrides.
@@ -50,8 +71,17 @@ that completion will wake the chat. Preflight failures prevent command launch.
 ## Results, lookup, cancellation
 
 Dispatch prints the job ID, command status, result path, and log path. Save these
-in the current project's run record if the project has one. `running` confirms
-the command spawned; it does not confirm useful computation or success.
+in the current project's run record if the project has one. Before yielding to
+completion, verify initial useful progress or entry into an expected startup
+stage with a known time budget and observable progress signal. `running` confirms
+only spawn; it does not confirm useful computation or success. For a command
+that already finished, inspect its terminal result instead.
+
+Avoid frequent model polling just to wait. Startup verification, a user-requested
+status check, an expected completion boundary, or suspected stagnation are useful
+reasons to inspect state and artifacts. Checks in an active turn do not monitor
+the job after yielding. On failure/timeout, diagnose and preserve partial results,
+then confirm the previous execution stopped before resuming or replacing it.
 
 ```bash
 node /absolute/skills/background-shell/scripts/background-shell.mjs status JOB_ID

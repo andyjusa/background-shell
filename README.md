@@ -87,6 +87,22 @@ node skills/background-shell/scripts/background-shell.mjs list
 - Commands must remain foreground children; don't daemonize them with `&` or
   `nohup`. No interactive PTY, regex monitor, remote scheduler, or Windows support.
 
+## Progress and stalls
+
+Detach finite work that can continue without further decisions. Exploratory scans
+benefit from a small sample or partial result before a full traversal. Confirm
+initial progress or an expected startup stage before leaving the job to run;
+`running` confirms process spawn only.
+
+For potentially blocking work, set a reasonable `--timeout-ms`. It defaults to
+zero (no runtime limit). Per-item timeouts and no-progress detection belong in the
+command or a job-specific wrapper; this helper does not provide a stall detector.
+A hung command won't send a completion wakeup until it exits or times out. Keep
+readable progress and partial results, and use meaningful stage timings instead
+of assuming that silence means failure. Startup/status checks are appropriate;
+frequent model polling is unnecessary. A check made before yielding cannot detect
+a later stall while the chat is idle.
+
 ## Privacy and execution permissions
 
 Job records and capped combined stdout/stderr live under
