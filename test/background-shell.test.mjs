@@ -8,6 +8,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { deliver, summary, atomicJson } from '../skills/background-shell/scripts/background-shell.mjs';
 import { Frames, encodeFrame, Rpc } from '../skills/background-shell/scripts/transport.mjs';
+import { acknowledge, notificationPaths, tryNotificationLock } from '../skills/background-shell/scripts/notifications.mjs';
 
 const cli = fileURLToPath(new URL('../skills/background-shell/scripts/background-shell.mjs', import.meta.url));
 const temp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'bs-'));
@@ -111,9 +112,13 @@ test('bounded summary treats logs as untrusted; tails are opt-in', t => {
   assert.match(out, /untrusted/); assert.match(out, /TAIL/); assert.doesNotMatch(out, /\\u001b/);
 });
 
-function fakeJob() { return { id: 'abc', notify: 'desktop', cwd: '/', tailBytes: 0, wakeWaitMs: 10 }; }
+function fakeJob(id = 'abc') { return { id, threadId: 'test', notify: 'desktop', cwd: '/', tailBytes: 0, wakeWaitMs: 5000 }; }
+function deliveryDir(t, home = temp(), id = 'abc') {
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const dir = path.join(home, id); fs.mkdirSync(dir, { mode: 0o700 }); return dir;
+}
 test('completion waits for idle, sends once, and repeat delivery does not duplicate', async t => {
-  const dir = temp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const dir = deliveryDir(t);
   let checks = 0, wakes = 0;
   const factory = async () => ({ status: async () => ++checks === 1 ? 'active' : 'idle', wake: async () => wakes++, close() {} });
   const state = { status: 'succeeded', exitCode: 0 };
@@ -123,7 +128,7 @@ test('completion waits for idle, sends once, and repeat delivery does not duplic
 });
 
 test('acknowledgement loss is unconfirmed, never automatically resent', async t => {
-  const dir = temp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const dir = deliveryDir(t);
   let calls = 0;
   const factory = async () => ({ status: async () => 'idle', wake: async () => { calls++; throw new Error('connection lost'); }, close() {} });
   const state = { status: 'failed', exitCode: 2 };
@@ -132,7 +137,7 @@ test('acknowledgement loss is unconfirmed, never automatically resent', async t 
 });
 
 test('unknown thread status fails closed without sending', async t => {
-  const dir = temp(); t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const dir = deliveryDir(t);
   let sent = false;
   const state = { status: 'succeeded' };
   await deliver(fakeJob(), dir, state, async () => ({ status: async () => 'unknown', wake: async () => { sent = true; }, close() {} }));
@@ -205,4 +210,187 @@ test('Desktop dispatch retains the worker connection and delivers to the origina
   for (let i = 0; i < 100 && read(launched.resultPath).wake !== 'accepted'; i++) await sleep(20);
   assert.equal(read(launched.resultPath).wake, 'accepted'); assert.equal(end.exitCode, 0);
   assert.equal(destination, 'original'); assert.equal(deliveries, 1); assert.equal(connections, 2);
+});
+
+
+test('ack is durable, idempotent, rejects running jobs, and preserves command state', async t => {
+  const home = temp(); t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const job = call(home, ['dispatch', '--', process.execPath, '-e', 'setTimeout(()=>{},150)']);
+  const before = spawnSync(process.execPath, [cli, 'ack', job.id], {
+    env: { ...process.env, BACKGROUND_SHELL_HOME: home }, encoding: 'utf8',
+  });
+  assert.notEqual(before.status, 0); assert.match(before.stderr, /completed command/);
+  const end = await terminal(home, job.id);
+  const ack = call(home, ['ack', job.id]);
+  assert.equal(ack.status, 'succeeded'); assert.equal(ack.notificationAlreadyAttempted, false);
+  assert.deepEqual(call(home, ['ack', job.id]), ack);
+  assert.deepEqual(read(job.resultPath), end);
+  assert.equal(call(home, ['status', job.id]).acknowledgedAt, ack.acknowledgedAt);
+  assert.equal(fs.statSync(path.join(home, job.id, 'ack.json')).mode & 0o777, 0o600);
+});
+
+test('acknowledged completion never opens the transport or sends a wake', async t => {
+  const dir = deliveryDir(t); const job = fakeJob();
+  const state = { status: 'failed', exitCode: 7, wake: 'pending', endedAt: new Date().toISOString() };
+  atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+  await acknowledge(dir, atomicJson);
+  let opened = false;
+  await deliver(job, dir, state, async () => { opened = true; throw new Error('must not connect'); });
+  assert.equal(opened, false); assert.equal(state.wake, 'suppressed'); assert.equal(state.exitCode, 7);
+  assert.equal(fs.existsSync(path.join(dir, 'wake.lock')), false);
+});
+
+test('ack during idle wait suppresses the pending wake without overwriting the worker', async t => {
+  const dir = deliveryDir(t); const job = fakeJob();
+  const state = { status: 'succeeded', exitCode: 0, wake: 'pending' };
+  atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+  let entered; const checked = new Promise(resolve => { entered = resolve; });
+  let calls = 0;
+  const pending = deliver(job, dir, state, async () => ({
+    status: async () => { entered(); return 'active'; }, wake: async () => calls++, close() {},
+  }));
+  await checked; await acknowledge(dir, atomicJson); await pending;
+  assert.equal(state.wake, 'suppressed'); assert.equal(calls, 0);
+  assert.ok(read(path.join(dir, 'state.json')).acknowledgedAt);
+});
+
+test('same-thread concurrent jobs serialize their send requests', async t => {
+  const home = temp(); const dirs = ['one', 'two'].map(id => deliveryDir(t, home, id));
+  let inFlight = 0, maxInFlight = 0, sends = 0;
+  const factory = async () => ({ status: async () => 'idle', close() {}, wake: async () => {
+    inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(80); sends++; inFlight--;
+  } });
+  const states = dirs.map(() => ({ status: 'succeeded', exitCode: 0 }));
+  await Promise.all(dirs.map((dir, i) => deliver(fakeJob(String(i)), dir, states[i], factory)));
+  assert.equal(sends, 2); assert.equal(maxInFlight, 1);
+  assert.ok(states.every(s => s.wake === 'accepted'));
+});
+
+test('different threads can notify independently', async t => {
+  const home = temp(); const dirs = ['one', 'two'].map(id => deliveryDir(t, home, id));
+  let inFlight = 0, maxInFlight = 0;
+  const factory = async () => ({ status: async () => 'idle', close() {}, wake: async () => {
+    inFlight++; maxInFlight = Math.max(maxInFlight, inFlight); await sleep(30); inFlight--;
+  } });
+  await Promise.all(dirs.map((dir, i) => deliver({ ...fakeJob(String(i)), threadId: `thread-${i}` }, dir,
+    { status: 'succeeded', exitCode: 0 }, factory)));
+  assert.equal(maxInFlight, 2);
+});
+
+test('Desktop startup gap cannot let a second idle observer submit another wake', async t => {
+  const home = temp(); const dirs = ['one', 'two'].map(id => deliveryDir(t, home, id));
+  let latestTurnId = 'original-turn', calls = 0;
+  const factory = async () => ({ snapshot: async () => ({ status: 'idle', latestTurnId }), close() {},
+    wake: async () => { calls++; } });
+  await deliver(fakeJob('one'), dirs[0], { status: 'succeeded' }, factory);
+  const state = { status: 'succeeded' };
+  const pending = deliver(fakeJob('two'), dirs[1], state, factory);
+  await sleep(30); assert.equal(calls, 1);
+  // Even if a short continuation completed between polls, its turn ID changed.
+  latestTurnId = 'notification-turn'; await pending;
+  assert.equal(calls, 2); assert.equal(state.wake, 'accepted');
+});
+
+test('ambiguous send blocks later same-thread wakes until a continuation is observed', async t => {
+  const home = temp(); const dirs = ['one', 'two'].map(id => deliveryDir(t, home, id));
+  let calls = 0;
+  const factory = async () => ({ snapshot: async () => ({ status: 'idle', latestTurnId: 'unchanged' }), close() {},
+    wake: async () => { calls++; throw new Error('lost response'); } });
+  const one = { status: 'succeeded' }, two = { status: 'succeeded' };
+  await deliver(fakeJob('one'), dirs[0], one, factory);
+  await deliver({ ...fakeJob('two'), wakeWaitMs: 50 }, dirs[1], two, factory);
+  assert.equal(one.wake, 'unconfirmed'); assert.equal(two.wake, 'failed'); assert.equal(calls, 1);
+  assert.match(two.wakeError, /queue remained busy/);
+});
+
+test('existing permanent attempt records are not overwritten or resent after upgrade', async t => {
+  const dir = deliveryDir(t); const state = { status: 'failed', wake: 'unconfirmed', wakeError: 'old lost response' };
+  atomicJson(path.join(dir, 'state.json'), state); fs.mkdirSync(path.join(dir, 'wake.lock'));
+  let opened = false;
+  await deliver(fakeJob(), dir, { ...state }, async () => { opened = true; });
+  assert.equal(opened, false); assert.deepEqual(read(path.join(dir, 'state.json')), state);
+});
+
+test('ack after sending records processing but does not claim recall', async t => {
+  const dir = deliveryDir(t); const job = fakeJob(); const state = { status: 'succeeded' };
+  atomicJson(path.join(dir, 'job.json'), job);
+  await deliver(job, dir, state, async () => ({ status: async () => 'idle', wake: async () => {}, close() {} }));
+  const ack = await acknowledge(dir, atomicJson);
+  assert.equal(ack.notificationAlreadyAttempted, true); assert.equal(ack.wake, 'accepted');
+  assert.equal(read(path.join(dir, 'state.json')).wake, 'accepted');
+});
+
+test('Desktop wake has a separate configurable acknowledgement timeout', async t => {
+  const home = temp(); const pipe = path.join(home, 'host.sock'); const sockets = new Set();
+  const server = net.createServer(socket => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket)); const frames = new Frames();
+    socket.on('data', chunk => { for (const m of frames.push(chunk)) {
+      let result;
+      if (m.method === 'tools/list') result = { tools: ['read_thread', 'send_message_to_thread'].map(name => ({ namespace: 'codex_app', name })) };
+      else if (m.params.tool === 'read_thread') result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ thread: { id: 'original', kind: 'codex', status: { type: 'idle' } }, turns: [{ id: 'last-turn' }] }) }] };
+      else { setTimeout(() => socket.write(encodeFrame({ id: m.id, result: { success: true, contentItems: [] } })), 80); continue; }
+      socket.write(encodeFrame({ id: m.id, result }));
+    } });
+  });
+  await new Promise(resolve => server.listen(pipe, resolve));
+  t.after(() => { for (const s of sockets) s.destroy(); server.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  const { desktopConnect } = await import('../skills/background-shell/scripts/transport.mjs');
+  const client = await desktopConnect(pipe, 'original', 40, 200);
+  try {
+    assert.deepEqual(await client.snapshot(), { status: 'idle', latestTurnId: 'last-turn' });
+    await client.wake('completed');
+  } finally { client.close(); }
+});
+
+
+test('separate Desktop worker processes serialize wakes across a delayed host turn start', async t => {
+  const home = temp(); const pipe = path.join(home, 'host.sock'); const sockets = new Set();
+  let latest = 'initial', status = 'active', inFlight = 0, maxInFlight = 0, deliveries = 0;
+  const ids = [];
+  const server = net.createServer(socket => {
+    sockets.add(socket); socket.on('close', () => sockets.delete(socket)); const frames = new Frames();
+    socket.on('data', chunk => { for (const m of frames.push(chunk)) {
+      let result;
+      if (m.method === 'tools/list') result = { tools: ['read_thread', 'send_message_to_thread'].map(name => ({ namespace: 'codex_app', name })) };
+      else if (m.params.tool === 'read_thread') result = { success: true, contentItems: [{ type: 'inputText', text: JSON.stringify({ thread: { id: 'original', kind: 'codex', status: { type: status } }, turns: [{ id: latest }] }) }] };
+      else {
+        assert.equal(status, 'idle'); deliveries++; inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+        ids.push(JSON.parse(m.params.arguments.prompt.split('\n').at(-1)).jobId);
+        const next = `turn-${deliveries}`;
+        // Return acceptance before the new turn is visible to read_thread.
+        setTimeout(() => { inFlight--; socket.write(encodeFrame({ id: m.id, result: { success: true, contentItems: [] } })); }, 40);
+        setTimeout(() => { latest = next; status = 'active'; }, 150);
+        setTimeout(() => { status = 'idle'; }, 350);
+        continue;
+      }
+      socket.write(encodeFrame({ id: m.id, result }));
+    } });
+  });
+  await new Promise(resolve => server.listen(pipe, resolve));
+  t.after(() => { for (const s of sockets) s.destroy(); server.close(); fs.rmSync(home, { recursive: true, force: true }); });
+  const launch = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, 'dispatch', '--wake', '--notify', 'desktop', '--wake-wait-ms', '15000', '--', process.execPath, '-e', 'setTimeout(()=>{},100)'], {
+      env: { ...process.env, CODEX_THREAD_ID: 'original', CODEX_APP_TOOLS_PIPE_PATH: pipe, BACKGROUND_SHELL_HOME: home },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', c => { stdout += c; }); child.stderr.on('data', c => { stderr += c; });
+    child.on('error', reject); child.on('exit', code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+  });
+  const jobs = await Promise.all([launch(), launch()]);
+  await Promise.all(jobs.map(job => terminal(home, job.id))); status = 'idle';
+  const deadline = Date.now() + 10000;
+  while (jobs.some(job => read(job.resultPath).wake !== 'accepted') && Date.now() < deadline) await sleep(20);
+  assert.ok(jobs.every(job => read(job.resultPath).wake === 'accepted'));
+  assert.equal(deliveries, 2); assert.equal(maxInFlight, 1); assert.equal(new Set(ids).size, 2);
+});
+
+test('a slow status response cannot send after the wake wait deadline', async t => {
+  const dir = deliveryDir(t); const state = { status: 'succeeded' }; let sent = 0;
+  await deliver({ ...fakeJob(), wakeWaitMs: 30 }, dir, state, async () => ({
+    snapshot: async () => { await sleep(80); return { status: 'idle', latestTurnId: 'old' }; },
+    wake: async () => sent++, close() {},
+  }));
+  assert.equal(state.wake, 'failed'); assert.equal(sent, 0);
+  assert.equal(fs.existsSync(path.join(dir, 'wake.lock')), false);
 });

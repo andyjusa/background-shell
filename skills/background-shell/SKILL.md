@@ -101,15 +101,30 @@ this record alone. Remote job allocation still follows `$shared-computer`.
 
 Command states: `queued`, `running`, `succeeded`, `failed`, `timed-out`, `cancelled`.
 Wake states: `pending`, `waiting`, `sending`, `accepted`, `failed`, `unconfirmed`,
-`disabled`. `accepted` means the host accepted the message/start request, not that
+`suppressed`, `disabled`. `accepted` means the host accepted the message/start request, not that
 the subsequent agent turn completed. `sending` or `unconfirmed` can mean the host
 received a request before the connection broke: do not resend automatically.
 
+After reading a terminal job's result, log, and expected artifacts and handling
+its outcome, run `ack JOB_ID`. This durably marks the result as processed and
+suppresses a still-pending wake. Do this before replacing a failed job or reporting
+results already inspected in the current turn. A status check alone is not an
+acknowledgement. Never acknowledge a running or unreviewed job. `ack` is idempotent
+and does not cancel work or recall a notification already attempted.
+
+```bash
+node /absolute/skills/background-shell/scripts/background-shell.mjs ack JOB_ID
+```
+
 The supervisor checks thread status without model calls and waits while the
 original chat is active (up to 24 hours by default). It never interrupts an active
-turn. A brief race between checking idle and sending remains host-dependent.
+turn. Same-thread workers serialize their status/send critical section. Desktop
+workers also wait until a previous notification's new turn is visible before
+sending the next one, including after an ambiguous response. Already-processed
+results are skipped. External user actions can still race with a status check.
 Once a send is attempted, a durable lock prevents automatic duplicate delivery;
-this is at-most-once attempt, not guaranteed exactly-once delivery.
+this is at-most-once attempt, not guaranteed exactly-once delivery. A dead worker's
+thread lock fails closed; inspect workers before removing that stale lock.
 
 ## Data and compatibility
 
@@ -128,6 +143,7 @@ key access. Do not reconnect through unrelated chat pipes or start a replacement
 session as a fallback. App Server mode uses the documented JSON-RPC protocol.
 
 Use `--timeout-ms N` to bound the command, `--wake-wait-ms N` to bound the idle
-wait. These are milliseconds and optional. On failure, retain records and report
+and notification-queue wait, and `--notify-timeout-ms N` for the send response
+(default 60 seconds). These are milliseconds and optional. On failure, retain records and report
 the command result separately from delivery. No model polling or monitor agent
 is needed. macOS and Linux are supported; Windows is not supported in version 0.1.

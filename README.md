@@ -68,6 +68,7 @@ Starting the agent's continuation does use the normal model and account limits.
 node skills/background-shell/scripts/background-shell.mjs dispatch -- npm test
 node skills/background-shell/scripts/background-shell.mjs dispatch --timeout-ms 600000 --shell 'npm run build && npm test'
 node skills/background-shell/scripts/background-shell.mjs status JOB_ID
+node skills/background-shell/scripts/background-shell.mjs ack JOB_ID
 node skills/background-shell/scripts/background-shell.mjs cancel JOB_ID
 node skills/background-shell/scripts/background-shell.mjs list
 ```
@@ -76,6 +77,16 @@ node skills/background-shell/scripts/background-shell.mjs list
 - Wake transports are preflighted before executing the command.
 - The supervisor waits for idle instead of interrupting the active turn. Default
   idle-wait deadline: 24 hours, adjustable with `--wake-wait-ms`.
+- Same-thread workers serialize status checks and send requests. Desktop workers
+  wait for the preceding notification's continuation to become visible before
+  sending another, so delayed turn startup cannot cause a simultaneous burst.
+- After inspecting a terminal result and handling its outcome, use `ack JOB_ID`.
+  Pending notifications are suppressed, including while a chat is busy. Merely
+  reading status does not acknowledge it; `ack` cannot recall an attempted send.
+- Send responses have a separate 60-second timeout, configurable with
+  `--notify-timeout-ms`. Ambiguous responses are never automatically retried.
+- A dead worker's notification lock fails closed with an explicit error. Inspect
+  the processes and recorded attempts before removing a stale lock.
 - Success, nonzero exit, spawn failure, and timeout are reported distinctly.
 - Cancellation contacts a private Unix socket, terminates the managed process
   group (TERM, then KILL after 1.5 seconds), and suppresses completion messages.
@@ -123,15 +134,22 @@ records may contain private command arguments and output; never commit them.
 npm test
 ```
 
-All 16 tests passed locally and in GitHub Actions on macOS and Ubuntu. Tests run
-real detached commands to check survival after dispatch exits, exit codes, spawn
+The 28 tests passed locally, including a two-worker Desktop mock with delayed
+turn startup. Tests run real detached commands to check survival after dispatch exits, exit codes, spawn
 errors, cancellation of descendants, timeouts, private records, and bounded logs.
 Mock host tests cover idle waiting, at-most-once attempts, acknowledgement loss,
 transport framing, retained Desktop connections, and App Server request shape.
+Regression tests cover processed-result suppression, acknowledgement during idle
+waiting, concurrent notification serialization, delayed turn visibility,
+independent threads, and preservation of older send-attempt records.
 
 A live smoke test on macOS with Codex Desktop's 0.159.2 runtime confirmed command
 completion, waiting while the original chat was active, an accepted completion
 message after it became idle, and an actual agent continuation in that same chat.
+A second live Desktop test with version 0.2.0 confirmed that acknowledging a
+completed command while its chat was busy suppresses the pending notification
+and lets the supervisor exit without sending a message.
+
 This does not prove compatibility with every Codex release. App Server mode has
 mock protocol coverage; it has not been verified against a live App Server here.
 

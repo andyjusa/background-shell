@@ -7,6 +7,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { desktopConnect, appServerConnect } from './transport.mjs';
+import { notificationPaths, tryNotificationLock, readOptional, acknowledged, acknowledge } from './notifications.mjs';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const LOG_LIMIT = 4 * 1024 * 1024;
@@ -44,8 +45,8 @@ export function summary(job, state, logPath) {
 }
 
 export async function connect(job) {
-  if (job.notify === 'desktop') return desktopConnect(job.pipePath, job.threadId);
-  if (job.notify === 'app-server') return appServerConnect(job.codex, job.socketPath, job.threadId);
+  if (job.notify === 'desktop') return desktopConnect(job.pipePath, job.threadId, 15000, job.notifyTimeoutMs);
+  if (job.notify === 'app-server') return appServerConnect(job.codex, job.socketPath, job.threadId, 15000, job.notifyTimeoutMs);
   throw new Error('No wake transport configured');
 }
 
@@ -53,25 +54,49 @@ export async function deliver(job, dir, state, factory = connect) {
   if (job.notify === 'none' || state.status === 'cancelled') {
     state.wake = 'disabled'; atomicJson(path.join(dir, 'state.json'), state); return;
   }
-  // A permanent attempt lock prevents retries after ambiguous acknowledgement.
-  const lock = path.join(dir, 'wake.lock');
-  try { fs.mkdirSync(lock, { mode: 0o700 }); }
+  if (fs.existsSync(path.join(dir, 'wake.lock'))) return;
+  // One delivery runner per job; the send-attempt lock is created only at send.
+  try { fs.mkdirSync(path.join(dir, 'delivery.lock'), { mode: 0o700 }); }
   catch (error) { if (error.code === 'EEXIST') return; throw error; }
   let client;
   state.wake = 'waiting'; atomicJson(path.join(dir, 'state.json'), state);
   try {
-    client = await factory(job);
+    const paths = notificationPaths(job, dir);
     const deadline = Date.now() + job.wakeWaitMs;
     for (;;) {
-      const status = await client.status();
-      if (status === 'idle') break;
-      if (status !== 'active') throw new Error(`Thread is not ready: ${status ?? 'unknown'}`);
-      if (Date.now() >= deadline) throw new Error('Thread remained active past wake deadline');
+      const ack = acknowledged(dir);
+      if (ack) { state.wake = 'suppressed'; state.acknowledgedAt = ack.acknowledgedAt; return; }
+      if (Date.now() >= deadline) throw new Error('Thread or notification queue remained busy past wake deadline');
+      const release = tryNotificationLock(paths.lock);
+      if (release) {
+        try {
+          // Recheck under the same lock used by ack and all other job workers.
+          const ack = acknowledged(dir);
+          if (ack) { state.wake = 'suppressed'; state.acknowledgedAt = ack.acknowledgedAt; return; }
+          client ??= await factory(job);
+          const snapshot = client.snapshot ? await client.snapshot() : { status: await client.status() };
+          if (!['idle', 'active'].includes(snapshot.status)) throw new Error(`Thread is not ready: ${snapshot.status ?? 'unknown'}`);
+          const previous = readOptional(paths.barrier);
+          if (snapshot.status === 'active') {
+            if (previous && !previous.activeSeen) atomicJson(paths.barrier, { ...previous, activeSeen: true });
+          } else if (!previous?.hasTurnSnapshot || previous.activeSeen || snapshot.latestTurnId !== previous.baselineTurnId) {
+            if (Date.now() >= deadline) throw new Error('Thread or notification queue remained busy past wake deadline');
+            // A send accepted by Desktop may precede the new turn becoming visible.
+            // Do not let another idle observer send until that turn has appeared.
+            fs.mkdirSync(path.join(dir, 'wake.lock'), { mode: 0o700 });
+            atomicJson(paths.barrier, { jobId: job.id, attemptedAt: new Date().toISOString(),
+              hasTurnSnapshot: Object.hasOwn(snapshot, 'latestTurnId'), baselineTurnId: snapshot.latestTurnId ?? null,
+              activeSeen: false });
+            state.wake = 'sending'; state.wakeAttemptedAt = new Date().toISOString();
+            atomicJson(path.join(dir, 'state.json'), state);
+            await client.wake(summary(job, state, path.join(dir, 'output.log')));
+            state.wake = 'accepted'; state.wakeAcceptedAt = new Date().toISOString();
+            return;
+          }
+        } finally { release(); }
+      }
       await delay(Math.min(2000, Math.max(1, deadline - Date.now())));
     }
-    state.wake = 'sending'; atomicJson(path.join(dir, 'state.json'), state);
-    await client.wake(summary(job, state, path.join(dir, 'output.log')));
-    state.wake = 'accepted'; state.wakeAcceptedAt = new Date().toISOString();
   } catch (error) {
     state.wake = state.wake === 'sending' ? 'unconfirmed' : 'failed';
     state.wakeError = error.message;
@@ -161,7 +186,7 @@ function options(args) {
     const arg = args[i];
     if (arg === '--') { out.command = args.slice(i + 1); break; }
     if (arg === '--wake') { out.wake = true; continue; }
-    if (!['--cwd', '--shell', '--thread-id', '--notify', '--socket', '--codex', '--timeout-ms', '--wake-wait-ms', '--tail-bytes'].includes(arg)) {
+    if (!['--cwd', '--shell', '--thread-id', '--notify', '--socket', '--codex', '--timeout-ms', '--wake-wait-ms', '--notify-timeout-ms', '--tail-bytes'].includes(arg)) {
       throw new Error(`Unknown option: ${arg}`);
     }
     if (args[i + 1] == null) throw new Error(`Missing value: ${arg}`);
@@ -195,6 +220,7 @@ async function dispatch(args) {
     codex: opts.codex || process.env.CODEX_CLI_PATH || 'codex',
     timeoutMs: integer(opts['timeout-ms'], 0, 0, 2147483647),
     wakeWaitMs: integer(opts['wake-wait-ms'], 86400000, 1, 2147483647),
+    notifyTimeoutMs: integer(opts['notify-timeout-ms'], 60000, 1, 2147483647),
     tailBytes: integer(opts['tail-bytes'], 0, 0, 4096), createdAt: new Date().toISOString() };
   if (notify === 'app-server' && (!job.socketPath || !path.isAbsolute(job.socketPath))) {
     throw new Error('App Server mode requires an existing absolute --socket path');
@@ -245,13 +271,16 @@ async function cancel(id) {
 export async function main(args) {
   const [action, ...rest] = args;
   if (action === 'dispatch') return dispatch(rest);
-  if (action === 'status') { print(read(path.join(jobDir(rest[0]), 'state.json'))); return; }
+  if (action === 'status') {
+    const dir = jobDir(rest[0]); print({ ...read(path.join(dir, 'state.json')), ...(acknowledged(dir) ?? {}) }); return;
+  }
+  if (action === 'ack') { print(await acknowledge(jobDir(rest[0]), atomicJson)); return; }
   if (action === 'cancel') return cancel(rest[0]);
   if (action === '_worker') return worker(rest[0]);
   if (action === 'list') {
     print(fs.existsSync(ROOT) ? fs.readdirSync(ROOT).filter(n => /^[a-f0-9]{16}$/.test(n)).map(n => read(path.join(jobDir(n), 'state.json'))) : []); return;
   }
-  console.log('background-shell dispatch [--wake] [--notify desktop|app-server|none] [--socket PATH] [--thread-id ID] [--timeout-ms N] [--tail-bytes N] [--cwd DIR] -- COMMAND ARGS...\nbackground-shell dispatch [options] --shell "COMMAND"\nbackground-shell status JOB_ID\nbackground-shell cancel JOB_ID\nbackground-shell list');
+  console.log('background-shell dispatch [--wake] [--notify desktop|app-server|none] [--socket PATH] [--thread-id ID] [--timeout-ms N] [--notify-timeout-ms N] [--tail-bytes N] [--cwd DIR] -- COMMAND ARGS...\nbackground-shell dispatch [options] --shell "COMMAND"\nbackground-shell status JOB_ID\nbackground-shell ack JOB_ID\nbackground-shell cancel JOB_ID\nbackground-shell list');
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === ENTRY) {
