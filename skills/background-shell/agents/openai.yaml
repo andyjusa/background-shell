@@ -1,0 +1,4 @@
+interface:
+  display_name: "Background Shell"
+  short_description: "Run shell jobs and wake the original Codex chat on completion"
+  default_prompt: "Use $background-shell to run this job in the background and notify this chat when it finishes."

@@ -1,0 +1,10 @@
+{
+  "name": "codex-background-shell",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Detached shell jobs with completion wakeups for Codex",
+  "engines": { "node": ">=22" },
+  "scripts": { "test": "node --test test/*.test.mjs" },
+  "license": "MIT"
+}
