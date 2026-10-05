@@ -111,6 +111,11 @@ suppresses a still-pending wake. Do this before replacing a failed job or report
 results already inspected in the current turn. A status check alone is not an
 acknowledgement. Never acknowledge a running or unreviewed job. `ack` is idempotent
 and does not cancel work or recall a notification already attempted.
+`status`, `list`, and `ack` show the processing marker consistently: an
+acknowledged result whose wake was never attempted appears as `suppressed`, even
+if its supervisor stopped before updating its record. The stored command state
+is unchanged. Repeating an existing acknowledgement and acknowledging a
+wake-disabled or cancelled job do not depend on another worker's thread lock.
 
 ```bash
 node /absolute/skills/background-shell/scripts/background-shell.mjs ack JOB_ID

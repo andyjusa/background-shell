@@ -394,3 +394,83 @@ test('a slow status response cannot send after the wake wait deadline', async t 
   assert.equal(state.wake, 'failed'); assert.equal(sent, 0);
   assert.equal(fs.existsSync(path.join(dir, 'wake.lock')), false);
 });
+
+function exitedPid() {
+  const child = spawnSync(process.execPath, ['-e', 'console.log(process.pid)'], { encoding: 'utf8' });
+  assert.equal(child.status, 0); return Number(child.stdout);
+}
+
+test('repeating a recorded ack does not depend on another worker\'s stale thread lock', async t => {
+  const dir = deliveryDir(t); const job = fakeJob();
+  const state = { status: 'succeeded', exitCode: 0, wake: 'waiting' };
+  atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+  const first = await acknowledge(dir, atomicJson);
+  const lock = notificationPaths(job, dir).lock;
+  atomicJson(lock, { pid: exitedPid(), token: 'dead-worker' });
+  assert.deepEqual(await acknowledge(dir, atomicJson), first);
+  assert.equal(fs.existsSync(lock), true);
+  assert.deepEqual(read(path.join(dir, 'state.json')), state);
+});
+
+test('wake-disabled and cancelled jobs can be acknowledged despite a stale Desktop lock', async t => {
+  const home = temp(); const dirs = ['none', 'cancelled'].map(id => deliveryDir(t, home, id));
+  const lock = notificationPaths(fakeJob(), dirs[0]).lock;
+  atomicJson(lock, { pid: exitedPid(), token: 'dead-worker' });
+  for (let i = 0; i < dirs.length; i++) {
+    const job = { ...fakeJob(String(i)), notify: i === 0 ? 'none' : 'desktop' };
+    const state = { status: i === 0 ? 'succeeded' : 'cancelled', wake: 'disabled' };
+    atomicJson(path.join(dirs[i], 'job.json'), job); atomicJson(path.join(dirs[i], 'state.json'), state);
+    assert.equal((await acknowledge(dirs[i], atomicJson)).wake, 'disabled');
+    assert.deepEqual(read(path.join(dirs[i], 'state.json')), state);
+  }
+  assert.equal(fs.existsSync(lock), true);
+});
+
+test('status and list show an acknowledged orphaned delivery as suppressed without changing state', async t => {
+  const home = temp(), id = '0000000000000001'; const dir = deliveryDir(t, home, id);
+  const job = fakeJob(id); const state = { id, status: 'succeeded', exitCode: 0, wake: 'waiting' };
+  atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+  fs.mkdirSync(path.join(dir, 'delivery.lock'));
+  const ack = await acknowledge(dir, atomicJson);
+  const status = call(home, ['status', id]), listed = call(home, ['list'])[0];
+  assert.deepEqual(listed, status); assert.equal(status.wake, 'suppressed');
+  assert.equal(status.acknowledgedAt, ack.acknowledgedAt); assert.equal(ack.wake, 'suppressed');
+  assert.deepEqual(read(path.join(dir, 'state.json')), state);
+  assert.equal(fs.existsSync(path.join(dir, 'delivery.lock')), true);
+});
+
+test('acknowledged sending, accepted, and unconfirmed notifications never appear recalled', async t => {
+  const home = temp();
+  for (const [i, wake] of ['sending', 'accepted', 'unconfirmed'].entries()) {
+    for (const hasLock of [false, true]) {
+      const id = `${i * 2 + Number(hasLock) + 1}`.padStart(16, '0'); const dir = deliveryDir(t, home, id);
+      const job = fakeJob(id); const state = { id, status: 'succeeded', wake };
+      atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+      if (hasLock) fs.mkdirSync(path.join(dir, 'wake.lock'));
+      const ack = await acknowledge(dir, atomicJson);
+      assert.equal(ack.wake, wake); assert.equal(ack.notificationAlreadyAttempted, hasLock);
+      assert.equal(call(home, ['status', id]).wake, wake);
+      assert.equal(call(home, ['list']).find(s => s.id === id).wake, wake);
+      assert.deepEqual(read(path.join(dir, 'state.json')), state);
+    }
+  }
+});
+
+test('separate processes acknowledge a wake-disabled job with one immutable marker', async t => {
+  const home = temp(), id = '0000000000000001'; const dir = deliveryDir(t, home, id);
+  const job = { ...fakeJob(id), notify: 'none' }; const state = { status: 'succeeded', wake: 'disabled' };
+  atomicJson(path.join(dir, 'job.json'), job); atomicJson(path.join(dir, 'state.json'), state);
+  const ack = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [cli, 'ack', id], {
+      env: { ...process.env, BACKGROUND_SHELL_HOME: home }, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', c => { stdout += c; }); child.stderr.on('data', c => { stderr += c; });
+    child.on('error', reject); child.on('exit', code => code === 0 ? resolve(JSON.parse(stdout)) : reject(new Error(stderr)));
+  });
+  const results = await Promise.all(Array.from({ length: 6 }, ack));
+  for (const result of results) assert.deepEqual(result, results[0]);
+  assert.equal(read(path.join(dir, 'ack.json')).acknowledgedAt, results[0].acknowledgedAt);
+  assert.equal(fs.existsSync(path.join(home, '.wake-threads')), false);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['ack.json', 'job.json', 'state.json']);
+});

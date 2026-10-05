@@ -51,8 +51,42 @@ export function tryNotificationLock(file) {
 
 export function acknowledged(dir) { return readOptional(path.join(dir, 'ack.json')); }
 
+const completed = state => ['succeeded', 'failed', 'timed-out', 'cancelled'].includes(state.status);
+
+export function effectiveState(dir, state = read(path.join(dir, 'state.json')), ack = acknowledged(dir)) {
+  if (!ack || !completed(state)) return state;
+  const result = { ...state, acknowledgedAt: ack.acknowledgedAt };
+  if (!fs.existsSync(path.join(dir, 'wake.lock')) && !state.wakeAttemptedAt
+    && !['sending', 'accepted', 'unconfirmed', 'disabled'].includes(state.wake)) result.wake = 'suppressed';
+  return result;
+}
+
 export async function acknowledge(dir, atomicJson) {
   const job = read(path.join(dir, 'job.json'));
+  const terminalState = () => {
+    const state = read(path.join(dir, 'state.json'));
+    if (!completed(state)) throw new Error('Only a completed command can be acknowledged; inspect its results first');
+    return state;
+  };
+  const record = state => {
+    let ack = acknowledged(dir);
+    if (!ack) {
+      const file = path.join(dir, 'ack.json');
+      const temp = `${file}.${randomBytes(6).toString('hex')}.candidate`;
+      try {
+        atomicJson(temp, { id: job.id, acknowledgedAt: new Date().toISOString(), status: state.status,
+          exitCode: state.exitCode, signal: state.signal, endedAt: state.endedAt });
+        // Publish a complete, immutable marker even when wake-disabled ack calls race.
+        try { fs.linkSync(temp, file); } catch (error) { if (error.code !== 'EEXIST') throw error; }
+        ack = acknowledged(dir);
+      } finally { if (fs.existsSync(temp)) fs.unlinkSync(temp); }
+    }
+    return { ...ack, wake: effectiveState(dir, state, ack).wake,
+      notificationAlreadyAttempted: fs.existsSync(path.join(dir, 'wake.lock')) };
+  };
+  const initial = terminalState();
+  // Returning an existing marker cannot race with a new send or recall one.
+  if (acknowledged(dir) || job.notify === 'none' || initial.status === 'cancelled') return record(initial);
   const paths = notificationPaths(job, dir);
   const deadline = Date.now() + (job.notifyTimeoutMs ?? 60000) + 5000;
   let release;
@@ -61,17 +95,7 @@ export async function acknowledge(dir, atomicJson) {
     await new Promise(resolve => setTimeout(resolve, 50));
   }
   try {
-    const state = read(path.join(dir, 'state.json'));
-    if (!['succeeded', 'failed', 'timed-out', 'cancelled'].includes(state.status)) {
-      throw new Error('Only a completed command can be acknowledged; inspect its results first');
-    }
-    let ack = acknowledged(dir);
-    if (!ack) {
-      ack = { id: job.id, acknowledgedAt: new Date().toISOString(), status: state.status,
-        exitCode: state.exitCode, signal: state.signal, endedAt: state.endedAt };
-      // Separate marker: never overwrite a live supervisor's state snapshot.
-      atomicJson(path.join(dir, 'ack.json'), ack);
-    }
-    return { ...ack, wake: state.wake, notificationAlreadyAttempted: fs.existsSync(path.join(dir, 'wake.lock')) };
+    // Never overwrite a live supervisor's state snapshot.
+    return record(terminalState());
   } finally { release(); }
 }

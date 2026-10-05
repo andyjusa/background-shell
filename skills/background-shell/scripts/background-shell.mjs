@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { desktopConnect, appServerConnect } from './transport.mjs';
-import { notificationPaths, tryNotificationLock, readOptional, acknowledged, acknowledge } from './notifications.mjs';
+import { notificationPaths, tryNotificationLock, readOptional, acknowledged, acknowledge, effectiveState } from './notifications.mjs';
 
 const ENTRY = fileURLToPath(import.meta.url);
 const LOG_LIMIT = 4 * 1024 * 1024;
@@ -272,13 +272,13 @@ export async function main(args) {
   const [action, ...rest] = args;
   if (action === 'dispatch') return dispatch(rest);
   if (action === 'status') {
-    const dir = jobDir(rest[0]); print({ ...read(path.join(dir, 'state.json')), ...(acknowledged(dir) ?? {}) }); return;
+    print(effectiveState(jobDir(rest[0]))); return;
   }
   if (action === 'ack') { print(await acknowledge(jobDir(rest[0]), atomicJson)); return; }
   if (action === 'cancel') return cancel(rest[0]);
   if (action === '_worker') return worker(rest[0]);
   if (action === 'list') {
-    print(fs.existsSync(ROOT) ? fs.readdirSync(ROOT).filter(n => /^[a-f0-9]{16}$/.test(n)).map(n => read(path.join(jobDir(n), 'state.json'))) : []); return;
+    print(fs.existsSync(ROOT) ? fs.readdirSync(ROOT).filter(n => /^[a-f0-9]{16}$/.test(n)).map(n => effectiveState(jobDir(n))) : []); return;
   }
   console.log('background-shell dispatch [--wake] [--notify desktop|app-server|none] [--socket PATH] [--thread-id ID] [--timeout-ms N] [--notify-timeout-ms N] [--tail-bytes N] [--cwd DIR] -- COMMAND ARGS...\nbackground-shell dispatch [options] --shell "COMMAND"\nbackground-shell status JOB_ID\nbackground-shell ack JOB_ID\nbackground-shell cancel JOB_ID\nbackground-shell list');
 }

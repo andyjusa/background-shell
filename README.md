@@ -134,14 +134,16 @@ records may contain private command arguments and output; never commit them.
 npm test
 ```
 
-The 28 tests passed locally, including a two-worker Desktop mock with delayed
+The 33 tests passed locally, including a two-worker Desktop mock with delayed
 turn startup. Tests run real detached commands to check survival after dispatch exits, exit codes, spawn
 errors, cancellation of descendants, timeouts, private records, and bounded logs.
 Mock host tests cover idle waiting, at-most-once attempts, acknowledgement loss,
 transport framing, retained Desktop connections, and App Server request shape.
 Regression tests cover processed-result suppression, acknowledgement during idle
 waiting, concurrent notification serialization, delayed turn visibility,
-independent threads, and preservation of older send-attempt records.
+independent threads, preservation of older send-attempt records, stale-lock
+acknowledgements, consistent status/list output, and concurrent immutable ack
+publication.
 
 A live smoke test on macOS with Codex Desktop's 0.159.2 runtime confirmed command
 completion, waiting while the original chat was active, an accepted completion
